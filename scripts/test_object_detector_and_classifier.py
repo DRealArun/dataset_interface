@@ -36,7 +36,8 @@ if __name__ == '__main__':
     class_metadata = utils.get_class_metadata(class_metadata_file_path)
     num_classes = len(class_metadata.keys())
     model = utils.get_model(num_classes)
-    model.load_state_dict(torch.load(model_path))
+    checkpoint = torch.load(model_path)
+    model.load_state_dict(checkpoint['model'])
     model.eval()
 
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')

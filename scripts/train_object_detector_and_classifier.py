@@ -2,6 +2,7 @@
 import os
 import random
 import yaml
+import glob
 import argparse
 
 import math
@@ -18,7 +19,7 @@ import dataset_interface.object_detection.dataset as dataset
 from dataset_interface.object_detection.engine import train_one_epoch, validate_one_epoch
 import dataset_interface.object_detection.utils as utils
 import dataset_interface.object_detection.transforms as T
-from dataset_interface.object_detection.dataset import DatasetCustom, DatasetVOC
+from dataset_interface.object_detection.dataset import DatasetCustom, DatasetVOC, OnlineImageComposer
 
 def get_transform(train):
     transforms = []
@@ -43,7 +44,7 @@ if __name__ == '__main__':
                            default=10)
     argparser.add_argument('-lr', '--learning_rate', type=float,
                            help='Initial learning rate',
-                           default=1e-4)
+                           default=0.005)
     argparser.add_argument('-b', '--training_batch_size', type=int,
                            help='Training batch size',
                            default=1)
@@ -57,9 +58,8 @@ if __name__ == '__main__':
                            choices=['voc', 'custom'],
                            help='Data annotation type (voc or custom)',
                            default='voc')
-    argparser.add_argument('-cp', '--checkpoint_path', type=str,
-                           help='Path to a checkpoint (model + optimizer state) for resuming training',
-                           default=None)
+    argparser.add_argument('-oa', '--online_augment', help='Use online augmentation for training',
+                           default=False, action='store_true')
 
     # we read all arguments
     args = argparser.parse_args()
@@ -72,7 +72,7 @@ if __name__ == '__main__':
     training_batch_size = args.training_batch_size
     learning_rate = args.learning_rate
     annotation_type = args.annotation_type
-    checkpoint_path = args.checkpoint_path
+    online_augment = args.online_augment
 
     print('\nThe following arguments were read:')
     print('------------------------------------')
@@ -85,7 +85,7 @@ if __name__ == '__main__':
     print('training_batch_size:     {0}'.format(training_batch_size))
     print('learning_rate:           {0}'.format(learning_rate))
     print('annotation_type:         {0}'.format(annotation_type))
-    print('checkpoint_path:         {0}'.format(checkpoint_path))
+    print('online_augment:          {0}'.format(online_augment))
     print('------------------------------------')
     print('Proceed with training (y/n)')
     proceed = input()
@@ -93,25 +93,60 @@ if __name__ == '__main__':
         print('Aborting training')
         sys.exit(1)
 
-    # we read the class metadata
-    class_metadata = utils.get_class_metadata(class_metadata_file_path)
-    class_metadata = {v:k for k, v in class_metadata.items()}
-    num_classes = len(class_metadata.keys())
+    if not online_augment:
+        # we read the class metadata
+        class_metadata = utils.get_class_metadata(class_metadata_file_path)
+        class_metadata = {v:k for k, v in class_metadata.items()}
+        num_classes = len(class_metadata.keys())
 
-    # we create a data loader by instantiating an appropriate
-    # dataset class depending on the annotation type
-    dataset = None
-    if annotation_type.lower() == 'voc':
-        dataset = DatasetVOC(data_path, get_transform(train=True), 'train', class_metadata)
+        # we create a data loader by instantiating an appropriate
+        # dataset class depending on the annotation type
+        dataset = None
+        if annotation_type.lower() == 'voc':
+            dataset_train = DatasetVOC(data_path, get_transform(train=True), 'train', class_metadata)
+        else:
+            dataset_train = DatasetCustom(data_path, get_transform(train=True), 'train')
+        dataset_val = dataset_train
     else:
-        dataset = DatasetCustom(data_path, get_transform(train=True), 'train')
+        # Use online augmentation dataset
+        print("Training using online data augmentation.")
+        img_tf_ranges = {'rotation': (0, (360 - 5), 5),  # inc is added later
+                         'resize': (0.75, 1.25, 0.1),
+                         # 'shear_x': (0.0, 0.4, 0.05),
+                         # 'shear_y': (0.0, 0.4, 0.05),
+                         }
+        img_app_ranges = {'contrast': (0.7, 1.0, 0.05),
+                          'brightness': (0.7, 1.0, 0.05),
+                          'sharpness': (0.1, 2.0, 0.1)
+                          }
+        range_dict = {'img_tf_ranges': img_tf_ranges,
+                      'img_app_ranges': img_app_ranges}
+        bg_dict = {'solid_colors': [(255, 255, 255), (0, 0, 0), (255, 0, 0), (0, 255, 0),
+                                    (0, 0, 255), (255, 255, 0), (0, 255, 255), (128, 0, 0),
+                                    (128, 128, 128), (128, 128, 0), (0, 128, 0), (128, 0, 128),
+                                    (0, 128, 128)],
+                   'img_background_paths': [f for f in glob.iglob(os.path.join(data_path, 'backgrounds/*.jpg'))],
+                   # 'color_spaces': [] # Add color map support later
+                   }
+        dataset_train = OnlineImageComposer(data_path, class_metadata_file_path, bg_dict, range_dict,
+                                            get_transform(train=True), True)
+
+        dataset_val = OnlineImageComposer(data_path, class_metadata_file_path, bg_dict, range_dict,
+                                          get_transform(train=False), True)
+
+        class_metadata = dataset_train.label_folder_map
+        with open('label_folder_map.yml', 'w') as outfile:
+            yaml.dump(class_metadata, outfile, default_flow_style=False)
+        class_metadata[0] = '__background' # Add background class
+        class_metadata = {v: k for k, v in class_metadata.items()}
+        num_classes = len(class_metadata.keys())
 
     # we split the dataset into train and validation sets
-    indices = torch.randperm(len(dataset)).tolist()
+    indices = torch.randperm(len(dataset_train)).tolist()
     train_split = math.ceil(0.7*len(indices))
 
-    dataset_train = torch.utils.data.Subset(dataset, indices[0:train_split])
-    dataset_val = torch.utils.data.Subset(dataset, indices[train_split:])
+    dataset_train = torch.utils.data.Subset(dataset_train, indices[0:train_split])
+    dataset_val = torch.utils.data.Subset(dataset_val, indices[train_split:])
 
     # we define training and validation data loaders
     data_loader_train = torch.utils.data.DataLoader(dataset_train,
@@ -131,24 +166,32 @@ if __name__ == '__main__':
 
     # we now define an optimiser, and train
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(params, lr=learning_rate)
+    # optimizer = torch.optim.Adam(params, lr=learning_rate)
+    optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.9, weight_decay=0.0005)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
     start_epoch = 0
-    if checkpoint_path:
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        start_epoch = checkpoint['epoch'] + 1
+    if not os.path.isdir(model_path):
+        print('Creating model directory {0}'.format(model_path))
+        os.mkdir(model_path)
+    else:
+        max_count = -1
+        checkpoint_path = ''
+        for ckpt in glob.iglob(os.path.join(model_path, '*.pt')):
+            epoch_num = int(ckpt.split('/')[-1].split('.')[0].split('model_')[-1])
+            if epoch_num > max_count:
+                max_count = epoch_num
+                checkpoint_path = ckpt
+        if max_count > -1:
+            print("Checkpoint from epoch {} found!".format(max_count))
+            checkpoint = torch.load(checkpoint_path)
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            start_epoch = checkpoint['epoch'] + 1
 
     # we clear the files in which the training and validation losses are saved
     open(train_loss_file_path, 'w').close()
     open(val_loss_file_path, 'w').close()
-
-    # we create the model path directory if it doesn't exist
-    if not os.path.isdir(model_path):
-        print('Creating model directory {0}'.format(model_path))
-        os.mkdir(model_path)
 
     print('Training will start from epoch {0}'.format(start_epoch))
     print('Training model for {0} epochs'.format(num_epochs - start_epoch))
